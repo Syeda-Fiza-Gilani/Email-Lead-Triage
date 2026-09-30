@@ -1,0 +1,373 @@
+{
+  "name": "Intelligent Email Lead Triage & Alerting",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {},
+        "options": {}
+      },
+      "id": "25db2df4-4fa1-492a-b82c-f484a13c3529",
+      "name": "Gmail Trigger - New Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1232,
+        96
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": ""
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const email = $input.first().json;\n\n// Force everything to a plain string no matter what shape it arrives in\nfunction forceString(val) {\n  if (val === null || val === undefined) return '';\n  if (typeof val === 'string') return val;\n  if (typeof val === 'number' || typeof val === 'boolean') return String(val);\n  if (Array.isArray(val)) return val.map(forceString).join(' ');\n  if (typeof val === 'object') {\n    if (val.value !== undefined) return forceString(val.value);\n    if (val.text !== undefined) return forceString(val.text);\n    if (val.address !== undefined) return forceString(val.address);\n    try { return JSON.stringify(val); } catch (e) { return ''; }\n  }\n  return '';\n}\n\nfunction getHeader(name) {\n  const headers = email.payload?.headers || email.headers;\n  if (Array.isArray(headers)) {\n    const found = headers.find(h => (h.name || '').toLowerCase() === name.toLowerCase());\n    if (found) return found.value;\n  }\n  return null;\n}\n\nconst fromRaw = getHeader('from') ?? email.From ?? email.from ?? (email.headers && email.headers.from) ?? '';\nconst subjectRaw = getHeader('subject') ?? email.Subject ?? email.subject ?? (email.headers && email.headers.subject) ?? '(No Subject)';\n\n// THE KEY FIX: wrap in String() again right at point of use, belt-and-suspenders\nconst fromHeader = String(forceString(fromRaw) || '');\nconst subject = String(forceString(subjectRaw) || '(No Subject)');\n\nconst emailMatch = fromHeader.match(/<(.+?)>/);\nconst senderEmail = emailMatch ? emailMatch[1].trim() : fromHeader.trim();\nconst senderName = fromHeader.replace(/<.+?>/, '').replace(/\"/g, '').trim() || senderEmail;\n\nlet bodyText = forceString(email.text || email.textPlain || '');\nif (!bodyText && email.html) {\n  bodyText = forceString(email.html).replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();\n}\nif (!bodyText) {\n  bodyText = forceString(email.snippet || '');\n}\n\nreturn [{\n  json: {\n    senderName,\n    senderEmail,\n    subject,\n    body: bodyText.trim(),\n    receivedAt: new Date().toISOString(),\n    messageId: email.id || email.messageId || '',\n    _debug_raw: email // TEMPORARY — remove once working, helps you see the real shape\n  }\n}];"
+      },
+      "id": "65e86f4c-25dd-4d42-9342-8872ec768f96",
+      "name": "Extract & Sanitize Email Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -976,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.0-flash",
+        "options": {}
+      },
+      "id": "851593d7-0a73-475f-b215-11d1c2c7d5ce",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        -736,
+        288
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "",
+          "name": ""
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"category\": \"Hot Lead\",\n  \"urgency\": \"High\",\n  \"summary\": \"Sender wants a demo of the enterprise plan this week.\",\n  \"suggested_reply\": \"Hi John, thanks for reaching out — I'd love to show you the enterprise plan. Are you free for a 20-minute call Thursday or Friday?\"\n}"
+      },
+      "id": "7e372fbc-2468-4368-b68e-61e1d8de1608",
+      "name": "Structured Output Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        -480,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are an expert sales and support triage assistant for a busy business. Analyze the following incoming email and classify it accurately.\n\nSENDER NAME: {{ $json.senderName }}\nSENDER EMAIL: {{ $json.senderEmail }}\nSUBJECT: {{ $json.subject }}\nBODY:\n{{ $json.body }}\n\nClassification guidance:\n- \"Hot Lead\": a new prospect showing genuine buying intent (pricing, demo, purchase, partnership).\n- \"Support Request\": an existing customer reporting an issue or asking for help.\n- \"Billing/Invoice\": questions about payments, invoices, refunds, or subscriptions.\n- \"Spam/Junk\": irrelevant, promotional, or clearly automated/unsolicited content.\n\"High\" urgency = hot leads ready to buy, angry/blocked customers, or time-sensitive billing issues. Otherwise use Medium or Low.\n\nReturn ONLY the structured JSON output, no extra commentary.",
+        "hasOutputParser": true
+      },
+      "id": "d7e6089c-9101-4941-ad72-3f4ce9eede15",
+      "name": "AI Lead Triage Analysis",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.6,
+      "position": [
+        -736,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiOutput = $input.first().json.output || $input.first().json;\nconst original = $('Extract & Sanitize Email Data').item.json;\n\nreturn [{\n  json: {\n    senderName: original.senderName,\n    senderEmail: original.senderEmail,\n    subject: original.subject,\n    body: original.body,\n    receivedAt: original.receivedAt,\n    category: aiOutput.category,\n    urgency: aiOutput.urgency,\n    summary: aiOutput.summary,\n    suggested_reply: aiOutput.suggested_reply\n  }\n}];"
+      },
+      "id": "1e91dc03-ff1b-4624-9301-2e34821a64b1",
+      "name": "Merge AI Result with Email Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -384,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.receivedAt }}",
+            "Category": "={{ $json.category }}",
+            "Summary": "={{ $json.summary }}",
+            "Urgency": "={{ $json.urgency }}",
+            "Sender Email": "={{ $json.senderEmail }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Sender Email",
+              "displayName": "Sender Email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Summary",
+              "displayName": "Summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "df999d14-826c-47e1-914e-8b0a263ba712",
+      "name": "Log Lead to Google Sheets CRM",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        -128,
+        96
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": ""
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.Urgency }}",
+              "rightValue": "High",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "id": "44967faf-b2c9-46b6-9bc8-89b10edf9aa7"
+            },
+            {
+              "leftValue": "={{ $json.Urgency }}",
+              "rightValue": "Hot Lead",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "id": "0849381c-650b-4ca0-83a3-4f7739546ab7"
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "12f4aae9-e480-4ab8-a120-eb78501c89f8",
+      "name": "Check Urgent Lead",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        128,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "name"
+        },
+        "text": "=🚨 *URGENT LEAD ALERT* 🚨\n\n*Category:* {{ $json.category }}\n*Urgency:* {{ $json.urgency }}\n*From:* {{ $json.senderName }} ({{ $json.senderEmail }})\n*Subject:* {{ $json.subject }}\n\n*Summary:* {{ $json.summary }}\n\n*Suggested Reply:*\n>{{ $json.suggested_reply }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "id": "0caf5422-e079-4124-81a9-5af4f26aca98",
+      "name": "Slack Alert - Urgent Lead",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        384,
+        -32
+      ],
+      "webhookId": "4578421d-a687-4978-bf52-f94154237312",
+      "credentials": {
+        "slackApi": {
+          "id": "",
+          "name": ""
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gmail Trigger - New Email": {
+      "main": [
+        [
+          {
+            "node": "Extract & Sanitize Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Sanitize Email Data": {
+      "main": [
+        [
+          {
+            "node": "AI Lead Routing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Lead Triage Analysis",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Lead Triage Analysis",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Lead Triage Analysis": {
+      "main": [
+        [
+          {
+            "node": "Merge AI Result with Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge AI Result with Email Data": {
+      "main": [
+        [
+          {
+            "node": "Log Lead to Google Sheets CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Lead to Google Sheets CRM": {
+      "main": [
+        [
+          {
+            "node": "Check Urgent Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Urgent Lead": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert - Urgent Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "25cae072-8897-4975-8375-b2c7a7f722e6",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "32b8323528711e73dc2ab1cf6f7d984cdfadbe0c9e3ede3ee4be3b9aeccbfbb2"
+  },
+  "nodeGroups": [],
+  "id": "2V4dK0BapVVg9Vt9",
+  "tags": []
+}
